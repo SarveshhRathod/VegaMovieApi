@@ -9,7 +9,7 @@
     "tough-cookie": "^5.1.1"
   },
   "devDependencies": {
-    "@vercel/node": "^3.2.33",
+    "@vercel/node": "latest",
     "typescript": "^5.7.3"
   }
 }

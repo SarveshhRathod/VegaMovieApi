@@ -1,11 +1,7 @@
 {
-  "name": "instant-link-api",
+  "name": "vegamovieapi",
   "version": "1.0.0",
   "private": true,
-  "scripts": {
-    "dev": "vercel dev",
-    "build": "tsc"
-  },
   "dependencies": {
     "axios": "^1.7.9",
     "axios-cookiejar-support": "^5.0.5",

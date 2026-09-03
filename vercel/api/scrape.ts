@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import axios from 'axios';
 import * as cheerio from 'cheerio';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -11,15 +10,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const pageResponse = await axios.get(url, {
+    const pageResponse = await fetch(url, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       },
-      timeout: 10000,
     });
 
-    const html = pageResponse.data;
+    const html = await pageResponse.text();
     const $ = cheerio.load(html);
 
     let directLink: string | null = null;

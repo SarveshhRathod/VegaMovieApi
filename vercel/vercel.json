@@ -3,6 +3,7 @@
   "rewrites": [
     { "source": "/", "destination": "/api/index" },
     { "source": "/stream", "destination": "/api/stream" },
-    { "source": "/watch", "destination": "/api/stream" }
+    { "source": "/watch", "destination": "/api/stream" },
+    { "source": "/scrape", "destination": "/api/scrape" }
   ]
 }

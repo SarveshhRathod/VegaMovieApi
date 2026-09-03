@@ -1,23 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import axios from 'axios';
-import { wrapper } from 'axios-cookiejar-support';
-import { CookieJar } from 'tough-cookie';
 import * as cheerio from 'cheerio';
-
-const jar = new CookieJar();
-const client = wrapper(
-  axios.create({
-    jar,
-    timeout: 12000,
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept':
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Referer': 'https://fast-dl.one/'
-    }
-  })
-);
 
 function resolveUrl(base: string, relative: string): string {
   try {
@@ -32,120 +14,212 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
 
   let currentUrl = targetUrl;
   let hops = 0;
+  const cookieJar: Record<string, string> = {};
+
+  const getCookieHeader = () =>
+    Object.entries(cookieJar)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+
+  const updateCookies = (res: Response) => {
+    const rawCookies = res.headers.get('set-cookie');
+    if (rawCookies) {
+      // Split and store cookies
+      const parts = rawCookies.split(/,(?=\s*[^;]+=[^;]+)/);
+      for (const part of parts) {
+        const cookie = part.split(';')[0].trim();
+        const eqIdx = cookie.indexOf('=');
+        if (eqIdx !== -1) {
+          const name = cookie.substring(0, eqIdx).trim();
+          const val = cookie.substring(eqIdx + 1).trim();
+          cookieJar[name] = val;
+        }
+      }
+    }
+  };
+
+  const defaultHeaders = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept':
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Referer': 'https://fast-dl.one/'
+  };
 
   while (hops < 6) {
-    const res = await client.get(currentUrl, {
-      maxRedirects: 5,
-      validateStatus: () => true
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    const html = typeof res.data === 'string' ? res.data : '';
+    try {
+      const res = await fetch(currentUrl, {
+        method: 'GET',
+        headers: {
+          ...defaultHeaders,
+          ...(Object.keys(cookieJar).length > 0 ? { Cookie: getCookieHeader() } : {})
+        },
+        redirect: 'manual',
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-    // 1. Check if direct video URL exists in page HTML
-    const match = html.match(videoRegex);
-    if (match) return match[0];
+      updateCookies(res);
 
-    const $ = cheerio.load(html);
-
-    // 2. Check anchor tags for direct Google link
-    let direct: string | null = null;
-    $('a[href]').each((_, el) => {
-      const href = $(el).attr('href') || '';
-      if (videoRegex.test(href)) direct = href;
-    });
-    if (direct) return direct;
-
-    // 3. Handle Fast-DL / Nexdrive intermediate forms or buttons
-    const verifyBtn = $('button, a').filter((_, el) =>
-      /Click Here to Verify|Verify|I'm Human|Get Link|Download/i.test($(el).text())
-    ).first();
-
-    if (verifyBtn.length) {
-      const form = verifyBtn.closest('form');
-      if (form.length) {
-        const actionAttr = form.attr('action') || '';
-        const action = actionAttr ? resolveUrl(currentUrl, actionAttr) : currentUrl;
-        const method = (form.attr('method') || 'post').toLowerCase();
-
-        const formData = new URLSearchParams();
-        form.find('input').each((_, input) => {
-          const name = $(input).attr('name');
-          const val = $(input).attr('value') || '';
-          if (name) formData.append(name, val);
-        });
-
-        const formRes = method === 'post' 
-          ? await client.post(action, formData.toString(), {
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: currentUrl }
-            })
-          : await client.get(action, { params: Object.fromEntries(formData) });
-
-        const formHtml = typeof formRes.data === 'string' ? formRes.data : '';
-        const formMatch = formHtml.match(videoRegex);
-        if (formMatch) return formMatch[0];
+      // Handle 3xx Redirects
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get('location');
+        if (location) {
+          currentUrl = resolveUrl(currentUrl, location);
+          hops++;
+          continue;
+        }
       }
 
-      const href = verifyBtn.attr('href') || verifyBtn.attr('data-href');
-      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-        currentUrl = resolveUrl(currentUrl, href);
+      const html = await res.text();
+
+      // Check for Google video link directly
+      const match = html.match(videoRegex);
+      if (match) return match[0];
+
+      const $ = cheerio.load(html);
+
+      // Check anchor tags
+      let directLink: string | null = null;
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        if (videoRegex.test(href)) {
+          directLink = href;
+        }
+      });
+      if (directLink) return directLink;
+
+      // Check verify buttons or forms
+      const verifyBtn = $('button, a')
+        .filter((_, el) =>
+          /Click Here to Verify|Verify|I'm Human|Get Link|Download/i.test($(el).text())
+        )
+        .first();
+
+      if (verifyBtn.length) {
+        const form = verifyBtn.closest('form');
+        if (form.length) {
+          const actionAttr = form.attr('action') || '';
+          const action = actionAttr ? resolveUrl(currentUrl, actionAttr) : currentUrl;
+          const method = (form.attr('method') || 'post').toLowerCase();
+
+          const formData = new URLSearchParams();
+          form.find('input').each((_, input) => {
+            const name = $(input).attr('name');
+            const val = $(input).attr('value') || '';
+            if (name) formData.append(name, val);
+          });
+
+          const postController = new AbortController();
+          const postTimeout = setTimeout(() => postController.abort(), 8000);
+
+          const formRes = await fetch(action, {
+            method: method.toUpperCase(),
+            headers: {
+              ...defaultHeaders,
+              'Content-Type': 'application/x-www-form-urlencoded',
+              Referer: currentUrl,
+              ...(Object.keys(cookieJar).length > 0 ? { Cookie: getCookieHeader() } : {})
+            },
+            body: method === 'post' ? formData.toString() : undefined,
+            redirect: 'manual',
+            signal: postController.signal
+          });
+          clearTimeout(postTimeout);
+
+          updateCookies(formRes);
+
+          if ([301, 302, 303, 307, 308].includes(formRes.status)) {
+            const loc = formRes.headers.get('location');
+            if (loc) {
+              currentUrl = resolveUrl(action, loc);
+              hops++;
+              continue;
+            }
+          }
+
+          const formHtml = await formRes.text();
+          const formMatch = formHtml.match(videoRegex);
+          if (formMatch) return formMatch[0];
+        }
+
+        const href = verifyBtn.attr('href') || verifyBtn.attr('data-href');
+        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+          currentUrl = resolveUrl(currentUrl, href);
+          hops++;
+          continue;
+        }
+      }
+
+      // Check G-Direct / Fast-DL redirects
+      let nextHop: string | null = null;
+      $('a[href]').each((_, el) => {
+        const text = $(el).text();
+        const href = $(el).attr('href') || '';
+        if (/G-Direct|VGMLINKS/i.test(text) && !href.startsWith('#')) {
+          nextHop = resolveUrl(currentUrl, href);
+        }
+      });
+
+      if (nextHop && nextHop !== currentUrl) {
+        currentUrl = nextHop;
         hops++;
         continue;
       }
+
+      break;
+    } catch {
+      clearTimeout(timeoutId);
+      break;
     }
-
-    // 4. Check standard G-Direct or Fast-dl anchor links
-    let nextHop: string | null = null;
-    $('a[href]').each((_, el) => {
-      const text = $(el).text();
-      const href = $(el).attr('href') || '';
-      if (/G-Direct|VGMLINKS/i.test(text) && !href.startsWith('#')) {
-        nextHop = resolveUrl(currentUrl, href);
-      }
-    });
-
-    if (nextHop && nextHop !== currentUrl) {
-      currentUrl = nextHop;
-      hops++;
-      continue;
-    }
-
-    break;
   }
 
   return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const { url } = req.query;
-
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'Missing ?url= parameter. Example: /stream?url=https://nexdrive.help/...' });
-  }
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Range');
-  res.setHeader('Accept-Ranges', 'bytes');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
   try {
+    const { url } = req.query;
+
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required "url" parameter. Example: /stream?url=https://nexdrive.help/...'
+      });
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(200).end();
+    }
+
+    // Direct Google CDN link bypass
+    if (url.includes('googleusercontent.com')) {
+      return res.redirect(302, url);
+    }
+
     const videoUrl = await extractGoogleVideoUrl(url);
 
     if (!videoUrl) {
       return res.status(404).json({
         success: false,
-        error: 'Destination video URL could not be resolved. Please verify if the Nexdrive token is still valid.'
+        error: 'Destination video URL could not be resolved from this link.'
       });
     }
 
-    // 302 Redirect to destination Google CDN:
-    // Enables seamless forward/backward playback scrub on players, and instant download on browsers
     return res.redirect(302, videoUrl);
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message });
+  } catch (error: any) {
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Internal Server Error'
+    });
   }
 }

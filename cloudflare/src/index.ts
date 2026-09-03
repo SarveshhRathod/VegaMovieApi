@@ -1,4 +1,5 @@
-// ================= IN-MEMORY CACHE =================
+// ================= MEMORY CACHE =================
+// Caches resolved Google CDN URLs so playback seek/scrub never re-triggers scraping
 const urlCache = new Map<string, { target: string; expiry: number }>();
 
 function resolveUrl(base: string, relative: string): string {
@@ -13,11 +14,12 @@ function isStaticAsset(urlStr: string): boolean {
   return /\.(?:css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot)(?:\?.*)?$/i.test(urlStr);
 }
 
-// ================= SCRAPER & VERIFICATION ENGINE =================
+// ================= MULTI-HOP SCRAPER =================
 async function resolveToGoogleUrl(
   targetUrl: string,
   debugLog: any[]
 ): Promise<string | null> {
+  // Check memory cache first (valid for 2 hours)
   const cached = urlCache.get(targetUrl);
   if (cached && Date.now() < cached.expiry) {
     debugLog.push({ step: "cache_hit", target: cached.target });
@@ -78,27 +80,27 @@ async function resolveToGoogleUrl(
 
     const html = await res.text();
 
-    // 1. Direct match for Google Video CDN
+    // 1. Direct match for Googleusercontent video CDN
     const videoMatch = html.match(
       /https:\/\/(?:video-downloads|drive)\.googleusercontent\.com\/[^\s"'<>]+/i
     );
     if (videoMatch) {
       debugLog.push({ found: "google_video", link: videoMatch[0] });
-      urlCache.set(targetUrl, { target: videoMatch[0], expiry: Date.now() + 3600 * 1000 });
+      urlCache.set(targetUrl, { target: videoMatch[0], expiry: Date.now() + 7200 * 1000 });
       return videoMatch[0];
     }
 
-    // 2. Scan JavaScript script tags for direct video URLs
+    // 2. Scan inline scripts for Google direct link
     const scriptUrlMatch = html.match(
       /["'](https?:\/\/[^"']*(?:googleusercontent\.com|drive\.google\.com)[^"']*)["']/i
     );
     if (scriptUrlMatch && !isStaticAsset(scriptUrlMatch[1])) {
       debugLog.push({ found: "google_video_in_js", link: scriptUrlMatch[1] });
-      urlCache.set(targetUrl, { target: scriptUrlMatch[1], expiry: Date.now() + 3600 * 1000 });
+      urlCache.set(targetUrl, { target: scriptUrlMatch[1], expiry: Date.now() + 7200 * 1000 });
       return scriptUrlMatch[1];
     }
 
-    // 3. Fast-DL Verification Forms (POST action)
+    // 3. Fast-DL Verification Form Submission
     const formMatch = html.match(/<form[^>]*action=["']([^"']*)["'][^>]*>([\s\S]*?)<\/form>/i);
     if (formMatch) {
       const formAction = formMatch[1] ? resolveUrl(current, formMatch[1]) : current;
@@ -142,11 +144,10 @@ async function resolveToGoogleUrl(
       );
       if (postVideo) {
         debugLog.push({ found: "google_video_via_post", link: postVideo[0] });
-        urlCache.set(targetUrl, { target: postVideo[0], expiry: Date.now() + 3600 * 1000 });
+        urlCache.set(targetUrl, { target: postVideo[0], expiry: Date.now() + 7200 * 1000 });
         return postVideo[0];
       }
 
-      // Check if POST response yielded next destination HTML
       const nextCandidate = formHtml.match(
         /href=["'](https?:\/\/[^"']*(?:fast-dl|download|drive)[^"']*)["']/i
       );
@@ -157,7 +158,7 @@ async function resolveToGoogleUrl(
       }
     }
 
-    // 4. Check for onclick JavaScript redirects: window.location.href = '...'
+    // 4. Onclick JS redirects
     const onclickMatch = html.match(
       /(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i
     );
@@ -171,7 +172,7 @@ async function resolveToGoogleUrl(
       }
     }
 
-    // 5. Anchor tags: G-Direct, VGMLINKS, Verify, or Download buttons (STRICTLY non-asset links)
+    // 5. Parse anchor tags (G-Direct, VGMLINKS, Fast-DL) filtering out assets
     const anchorRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let foundNext: string | null = null;
     let aMatch;
@@ -186,13 +187,11 @@ async function resolveToGoogleUrl(
 
       const fullHref = resolveUrl(current, rawHref);
 
-      // Prioritize download / verify buttons
       if (/G-Direct|VGMLINKS|Verify|Human|Download|Get Link/i.test(aText)) {
         foundNext = fullHref;
         break;
       }
 
-      // Secondary check on URL path keywords
       if (!foundNext && /(?:fast-dl\.one\/dl\/|g-direct|download)/i.test(fullHref) && fullHref !== current) {
         foundNext = fullHref;
       }
@@ -205,7 +204,7 @@ async function resolveToGoogleUrl(
       continue;
     }
 
-    debugLog.push({ snippet: html.substring(0, 300).replace(/\s+/g, " ") });
+    debugLog.push({ snippet: html.substring(0, 250).replace(/\s+/g, " ") });
     break;
   }
 
@@ -217,35 +216,7 @@ export default {
   async fetch(request: Request): Promise<Response> {
     const urlObj = new URL(request.url);
 
-    if (urlObj.pathname === "/" || urlObj.pathname === "") {
-      const docsHtml = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>VegaMovie API - Cloudflare Worker</title>
-  <style>
-    body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, sans-serif; padding: 40px 20px; }
-    .card { background: #161b22; border: 1px solid rgba(255,255,255,0.1); padding: 24px; border-radius: 8px; max-width: 720px; margin: auto; }
-    h2 { color: #f0f6fc; margin-bottom: 12px; }
-    code { background: #090d13; color: #79c0ff; padding: 4px 8px; border-radius: 4px; font-family: monospace; }
-    .badge { background: #238636; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 12px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>VegaMovie Worker: ONLINE</h2>
-    <p>Supports byte-range scrubbing (HTTP 206) in video players and direct browser download.</p>
-    <br>
-    <p><span class="badge">GET</span> <code>/stream?url={TARGET_URL}</code></p>
-    <p><span class="badge">GET</span> <code>/stream?url={TARGET_URL}&debug=1</code></p>
-  </div>
-</body>
-</html>`;
-      return new Response(docsHtml, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
-
+    // 1. CORS Preflight Support (Crucial for online web players)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -258,20 +229,22 @@ export default {
       });
     }
 
+    // 2. Reverse-Proxy Video Stream Endpoint
     if (urlObj.pathname === "/stream" || urlObj.pathname === "/watch") {
       const inputUrl = urlObj.searchParams.get("url");
       const isDebug = urlObj.searchParams.get("debug") === "1";
 
       if (!inputUrl) {
-        return new Response(JSON.stringify({ error: "Missing ?url= parameter" }), {
+        return new Response(JSON.stringify({ success: false, error: 'Missing "?url=" parameter' }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
         });
       }
 
       const debugLog: any[] = [];
-      let finalUrl = inputUrl;
+      let destinationUrl = inputUrl;
 
+      // Scrape only if not already direct Google CDN link
       if (!inputUrl.includes("googleusercontent.com")) {
         const resolved = await resolveToGoogleUrl(inputUrl, debugLog);
         if (!resolved) {
@@ -290,12 +263,13 @@ export default {
             }
           );
         }
-        finalUrl = resolved;
+        destinationUrl = resolved;
       }
 
+      // If debug param is set, inspect JSON output
       if (isDebug) {
         return new Response(
-          JSON.stringify({ success: true, final_url: finalUrl, trace: debugLog }, null, 2),
+          JSON.stringify({ success: true, destination: destinationUrl, trace: debugLog }, null, 2),
           {
             headers: {
               "Content-Type": "application/json",
@@ -305,29 +279,32 @@ export default {
         );
       }
 
-      // Proxy Range request to Google CDN for timeline seeking
+      // ================= ZERO REDIRECTION STREAM PROXY =================
+      // Pass player Range headers straight to Google CDN
       const clientRange = request.headers.get("Range");
-      const fetchHeaders = new Headers({
-        "User-Agent":
-          request.headers.get("User-Agent") ||
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      const upstreamHeaders = new Headers({
+        "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "*/*",
       });
 
       if (clientRange) {
-        fetchHeaders.set("Range", clientRange);
+        upstreamHeaders.set("Range", clientRange);
       }
 
-      const videoRes = await fetch(finalUrl, {
+      // Fetch the video chunks directly from Google
+      const upstreamRes = await fetch(destinationUrl, {
         method: request.method,
-        headers: fetchHeaders,
+        headers: upstreamHeaders,
       });
 
-      const responseHeaders = new Headers();
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Accept-Ranges", "bytes");
+      // Mirror response headers back to player
+      const proxyHeaders = new Headers();
+      proxyHeaders.set("Access-Control-Allow-Origin", "*");
+      proxyHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      proxyHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+      proxyHeaders.set("Accept-Ranges", "bytes");
 
-      const copyHeaders = [
+      const forwardable = [
         "content-type",
         "content-length",
         "content-range",
@@ -335,26 +312,36 @@ export default {
         "etag",
       ];
 
-      for (const h of copyHeaders) {
-        const val = videoRes.headers.get(h);
-        if (val) responseHeaders.set(h, val);
+      for (const headerName of forwardable) {
+        const val = upstreamRes.headers.get(headerName);
+        if (val) proxyHeaders.set(headerName, val);
       }
 
-      if (!responseHeaders.has("content-type")) {
-        responseHeaders.set("content-type", "video/mp4");
+      if (!proxyHeaders.has("content-type")) {
+        proxyHeaders.set("content-type", "video/mp4");
       }
 
-      responseHeaders.set("Content-Disposition", 'inline; filename="video.mp4"');
+      // Allows in-browser seeking and direct clean downloads
+      proxyHeaders.set("Content-Disposition", 'inline; filename="video.mp4"');
 
-      return new Response(videoRes.body, {
-        status: videoRes.status,
-        headers: responseHeaders,
+      // Return stream with 206 Partial Content (Seek) or 200 OK
+      return new Response(upstreamRes.body, {
+        status: upstreamRes.status,
+        statusText: upstreamRes.statusText,
+        headers: proxyHeaders,
       });
     }
 
-    return new Response(JSON.stringify({ error: "Endpoint not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+    // Default status route
+    return new Response(
+      JSON.stringify({
+        status: "ACTIVE",
+        engine: "Zero-Redirection Reverse Proxy",
+        usage: "/stream?url=YOUR_NEXDRIVE_URL",
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   },
 };

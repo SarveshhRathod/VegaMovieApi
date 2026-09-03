@@ -9,89 +9,127 @@ function resolveUrl(base: string, relative: string): string {
   }
 }
 
-async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> {
-  const videoRegex = /https:\/\/(?:video-downloads|drive)\.googleusercontent\.com\/[^\s"'<>]+/i;
+async function fetchWithSession(
+  targetUrl: string,
+  cookieJar: Record<string, string>,
+  options: RequestInit = {}
+): Promise<{ text: string; status: number; location: string | null; url: string }> {
+  const cookieHeader = Object.entries(cookieJar)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
 
-  let currentUrl = targetUrl;
-  let hops = 0;
-  const cookieJar: Record<string, string> = {};
-
-  const getCookieHeader = () =>
-    Object.entries(cookieJar)
-      .map(([k, v]) => `${k}=${v}`)
-      .join('; ');
-
-  const updateCookies = (res: Response) => {
-    const rawCookies = res.headers.get('set-cookie');
-    if (rawCookies) {
-      const parts = rawCookies.split(/,(?=\s*[^;]+=[^;]+)/);
-      for (const part of parts) {
-        const cookie = part.split(';')[0].trim();
-        const eqIdx = cookie.indexOf('=');
-        if (eqIdx !== -1) {
-          const name = cookie.substring(0, eqIdx).trim();
-          const val = cookie.substring(eqIdx + 1).trim();
-          cookieJar[name] = val;
-        }
-      }
-    }
-  };
-
-  const defaultHeaders = {
+  const headers = new Headers({
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept':
       'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Referer': 'https://fast-dl.one/'
-  };
+    'Referer': targetUrl,
+    ...(options.headers as any),
+  });
 
-  while (hops < 6) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+  if (cookieHeader) {
+    headers.set('Cookie', cookieHeader);
+  }
 
-    try {
-      const res = await fetch(currentUrl, {
-        method: 'GET',
-        headers: {
-          ...defaultHeaders,
-          ...(Object.keys(cookieJar).length > 0 ? { Cookie: getCookieHeader() } : {})
-        },
-        redirect: 'manual',
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+  const res = await fetch(targetUrl, {
+    ...options,
+    headers,
+    redirect: 'manual',
+  });
 
-      updateCookies(res);
+  // Extract set-cookie
+  const rawCookies = res.headers.get('set-cookie');
+  if (rawCookies) {
+    const parts = rawCookies.split(/,(?=\s*[^;]+=[^;]+)/);
+    for (const part of parts) {
+      const cookie = part.split(';')[0].trim();
+      const eqIdx = cookie.indexOf('=');
+      if (eqIdx !== -1) {
+        cookieJar[cookie.substring(0, eqIdx).trim()] = cookie.substring(eqIdx + 1).trim();
+      }
+    }
+  }
 
-      if ([301, 302, 303, 307, 308].includes(res.status)) {
-        const location = res.headers.get('location');
-        if (location) {
-          currentUrl = resolveUrl(currentUrl, location);
-          hops++;
-          continue;
-        }
+  const text = await res.text();
+  const location = res.headers.get('location');
+
+  return { text, status: res.status, location, url: targetUrl };
+}
+
+function findDirectVideoLink(html: string): string | null {
+  const videoRegex = /https:\/\/(?:video-downloads|drive)\.googleusercontent\.com\/[^\s"'<>]+/i;
+  const match = html.match(videoRegex);
+  if (match) return match[0];
+
+  const $ = cheerio.load(html);
+  let result: string | null = null;
+  $('a[href]').each((_, el) => {
+    const href = $(el).attr('href') || '';
+    if (videoRegex.test(href)) {
+      result = href;
+    }
+  });
+  return result;
+}
+
+async function resolveFullWorkflow(inputUrl: string): Promise<string | null> {
+  const cookieJar: Record<string, string> = {};
+
+  // Step 1: Fetch the initial Nexdrive page
+  let step1 = await fetchWithSession(inputUrl, cookieJar);
+
+  // Handle immediate 3xx redirects
+  if ([301, 302, 303, 307, 308].includes(step1.status) && step1.location) {
+    step1 = await fetchWithSession(resolveUrl(inputUrl, step1.location), cookieJar);
+  }
+
+  // Check if video link is already here
+  let directVideo = findDirectVideoLink(step1.text);
+  if (directVideo) return directVideo;
+
+  // Step 2: Extract G-Direct or VGMLINKS candidate link
+  const $1 = cheerio.load(step1.text);
+  const candidates: string[] = [];
+
+  $1('a[href]').each((_, el) => {
+    const txt = $1(el).text().trim();
+    const href = $1(el).attr('href');
+    if (href && (txt.includes('G-Direct') || txt.includes('VGMLINKS') || /fast-dl|download|hubcloud/i.test(href))) {
+      candidates.push(resolveUrl(step1.url, href));
+    }
+  });
+
+  if (!candidates.length) {
+    // If no specific buttons found, scan all external download links
+    $1('a[href]').each((_, el) => {
+      const href = $1(el).attr('href') || '';
+      if (!href.startsWith('#') && !href.startsWith('javascript:') && href.startsWith('http')) {
+        candidates.push(href);
+      }
+    });
+  }
+
+  // Step 3: Iterate candidates and follow the verification process
+  for (const candidateUrl of candidates) {
+    let currentUrl = candidateUrl;
+    let hops = 0;
+
+    while (hops < 6) {
+      const res = await fetchWithSession(currentUrl, cookieJar);
+
+      if ([301, 302, 303, 307, 308].includes(res.status) && res.location) {
+        currentUrl = resolveUrl(currentUrl, res.location);
+        hops++;
+        continue;
       }
 
-      const html = await res.text();
+      directVideo = findDirectVideoLink(res.text);
+      if (directVideo) return directVideo;
 
-      const match = html.match(videoRegex);
-      if (match) return match[0];
-
-      const $ = cheerio.load(html);
-
-      let directLink: string | null = null;
-      $('a[href]').each((_, el) => {
-        const href = $(el).attr('href') || '';
-        if (videoRegex.test(href)) {
-          directLink = href;
-        }
-      });
-      if (directLink) return directLink;
-
-      const verifyBtn = $('button, a')
-        .filter((_, el) =>
-          /Click Here to Verify|Verify|I'm Human|Get Link|Download/i.test($(el).text())
-        )
+      // Handle Fast-DL verification button/form
+      const $page = cheerio.load(res.text);
+      const verifyBtn = $page('button, a')
+        .filter((_, el) => /Click Here to Verify|Verify|I'm Human|Get Link|Download/i.test($page(el).text()))
         .first();
 
       if (verifyBtn.length) {
@@ -103,70 +141,38 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
 
           const formData = new URLSearchParams();
           form.find('input').each((_, input) => {
-            const name = $(input).attr('name');
-            const val = $(input).attr('value') || '';
+            const name = $page(input).attr('name');
+            const val = $page(input).attr('value') || '';
             if (name) formData.append(name, val);
           });
 
-          const postController = new AbortController();
-          const postTimeout = setTimeout(() => postController.abort(), 8000);
-
-          const formRes = await fetch(action, {
+          const postRes = await fetchWithSession(action, cookieJar, {
             method: method.toUpperCase(),
             headers: {
-              ...defaultHeaders,
               'Content-Type': 'application/x-www-form-urlencoded',
               Referer: currentUrl,
-              ...(Object.keys(cookieJar).length > 0 ? { Cookie: getCookieHeader() } : {})
             },
             body: method === 'post' ? formData.toString() : undefined,
-            redirect: 'manual',
-            signal: postController.signal
           });
-          clearTimeout(postTimeout);
 
-          updateCookies(formRes);
-
-          if ([301, 302, 303, 307, 308].includes(formRes.status)) {
-            const loc = formRes.headers.get('location');
-            if (loc) {
-              currentUrl = resolveUrl(action, loc);
-              hops++;
-              continue;
-            }
+          if ([301, 302, 303, 307, 308].includes(postRes.status) && postRes.location) {
+            currentUrl = resolveUrl(action, postRes.location);
+            hops++;
+            continue;
           }
 
-          const formHtml = await formRes.text();
-          const formMatch = formHtml.match(videoRegex);
-          if (formMatch) return formMatch[0];
+          directVideo = findDirectVideoLink(postRes.text);
+          if (directVideo) return directVideo;
         }
 
-        const href = verifyBtn.attr('href') || verifyBtn.attr('data-href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          currentUrl = resolveUrl(currentUrl, href);
+        const dataHref = verifyBtn.attr('data-href') || verifyBtn.attr('href');
+        if (dataHref && !dataHref.startsWith('#') && !dataHref.startsWith('javascript:')) {
+          currentUrl = resolveUrl(currentUrl, dataHref);
           hops++;
           continue;
         }
       }
 
-      let nextHop: string | null = null;
-      $('a[href]').each((_, el) => {
-        const text = $(el).text();
-        const href = $(el).attr('href') || '';
-        if (/G-Direct|VGMLINKS/i.test(text) && !href.startsWith('#')) {
-          nextHop = resolveUrl(currentUrl, href);
-        }
-      });
-
-      if (nextHop && nextHop !== currentUrl) {
-        currentUrl = nextHop;
-        hops++;
-        continue;
-      }
-
-      break;
-    } catch {
-      clearTimeout(timeoutId);
       break;
     }
   }
@@ -175,44 +181,38 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const { url } = req.query;
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ success: false, error: 'Missing ?url= parameter' });
+  }
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
+  if (url.includes('googleusercontent.com')) {
+    return res.redirect(302, url);
+  }
+
   try {
-    const { url } = req.query;
+    const finalVideoUrl = await resolveFullWorkflow(url);
 
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required "url" parameter. Example: /stream?url=https://nexdrive.help/...'
-      });
-    }
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(200).end();
-    }
-
-    if (url.includes('googleusercontent.com')) {
-      return res.redirect(302, url);
-    }
-
-    const videoUrl = await extractGoogleVideoUrl(url);
-
-    if (!videoUrl) {
+    if (!finalVideoUrl) {
       return res.status(404).json({
         success: false,
         error: 'Destination video URL could not be resolved from this link.'
       });
     }
 
-    return res.redirect(302, videoUrl);
-  } catch (error: any) {
-    return res.status(500).json({
-      success: false,
-      error: error?.message || 'Internal Server Error'
-    });
+    return res.redirect(302, finalVideoUrl);
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 }

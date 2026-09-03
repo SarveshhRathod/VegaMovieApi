@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/stream", "destination": "/api/stream" },
+    { "source": "/scrape", "destination": "/api/scrape" }
+  ]
+}

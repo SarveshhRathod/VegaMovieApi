@@ -1,4 +1,4 @@
-// ================= CONFIG & IN-MEMORY CACHE =================
+// ================= IN-MEMORY CACHE =================
 const urlCache = new Map<string, { target: string; expiry: number }>();
 
 function resolveUrl(base: string, relative: string): string {
@@ -9,12 +9,15 @@ function resolveUrl(base: string, relative: string): string {
   }
 }
 
+function isStaticAsset(urlStr: string): boolean {
+  return /\.(?:css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot)(?:\?.*)?$/i.test(urlStr);
+}
+
 // ================= SCRAPER & VERIFICATION ENGINE =================
 async function resolveToGoogleUrl(
   targetUrl: string,
   debugLog: any[]
 ): Promise<string | null> {
-  // Check memory cache first (valid for 1 hour)
   const cached = urlCache.get(targetUrl);
   if (cached && Date.now() < cached.expiry) {
     debugLog.push({ step: "cache_hit", target: cached.target });
@@ -50,7 +53,7 @@ async function resolveToGoogleUrl(
   let hops = 0;
 
   while (hops < 7) {
-    debugLog.push({ hop: hops, url: current });
+    debugLog.push({ hop: hops, fetching: current });
 
     const res = await fetch(current, {
       headers: {
@@ -64,7 +67,6 @@ async function resolveToGoogleUrl(
     updateCookies(res);
     debugLog.push({ hop: hops, status: res.status });
 
-    // Handle standard 3xx redirects
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get("location");
       if (loc) {
@@ -76,7 +78,7 @@ async function resolveToGoogleUrl(
 
     const html = await res.text();
 
-    // 1. Direct match for Googleusercontent video CDN
+    // 1. Direct match for Google Video CDN
     const videoMatch = html.match(
       /https:\/\/(?:video-downloads|drive)\.googleusercontent\.com\/[^\s"'<>]+/i
     );
@@ -86,18 +88,17 @@ async function resolveToGoogleUrl(
       return videoMatch[0];
     }
 
-    // 2. Intermediate links (Fast-DL, HubCloud, G-Direct, VGMLINKS)
-    const linkMatch = html.match(
-      /href=["'](https?:\/\/[^"']*(?:fast-dl|g-direct|download|hubcloud|drive|file)[^"']*)["']/i
+    // 2. Scan JavaScript script tags for direct video URLs
+    const scriptUrlMatch = html.match(
+      /["'](https?:\/\/[^"']*(?:googleusercontent\.com|drive\.google\.com)[^"']*)["']/i
     );
-    if (linkMatch && linkMatch[1] && linkMatch[1] !== current) {
-      debugLog.push({ found: "intermediate_link", link: linkMatch[1] });
-      current = linkMatch[1];
-      hops++;
-      continue;
+    if (scriptUrlMatch && !isStaticAsset(scriptUrlMatch[1])) {
+      debugLog.push({ found: "google_video_in_js", link: scriptUrlMatch[1] });
+      urlCache.set(targetUrl, { target: scriptUrlMatch[1], expiry: Date.now() + 3600 * 1000 });
+      return scriptUrlMatch[1];
     }
 
-    // 3. Fast-DL Verification / Token form submission
+    // 3. Fast-DL Verification Forms (POST action)
     const formMatch = html.match(/<form[^>]*action=["']([^"']*)["'][^>]*>([\s\S]*?)<\/form>/i);
     if (formMatch) {
       const formAction = formMatch[1] ? resolveUrl(current, formMatch[1]) : current;
@@ -144,11 +145,67 @@ async function resolveToGoogleUrl(
         urlCache.set(targetUrl, { target: postVideo[0], expiry: Date.now() + 3600 * 1000 });
         return postVideo[0];
       }
+
+      // Check if POST response yielded next destination HTML
+      const nextCandidate = formHtml.match(
+        /href=["'](https?:\/\/[^"']*(?:fast-dl|download|drive)[^"']*)["']/i
+      );
+      if (nextCandidate && !isStaticAsset(nextCandidate[1])) {
+        current = nextCandidate[1];
+        hops++;
+        continue;
+      }
     }
 
-    debugLog.push({
-      snippet: html.substring(0, 250).replace(/\s+/g, " "),
-    });
+    // 4. Check for onclick JavaScript redirects: window.location.href = '...'
+    const onclickMatch = html.match(
+      /(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i
+    );
+    if (onclickMatch && !isStaticAsset(onclickMatch[1])) {
+      const nextUrl = resolveUrl(current, onclickMatch[1]);
+      if (nextUrl !== current) {
+        debugLog.push({ found: "onclick_redirect", link: nextUrl });
+        current = nextUrl;
+        hops++;
+        continue;
+      }
+    }
+
+    // 5. Anchor tags: G-Direct, VGMLINKS, Verify, or Download buttons (STRICTLY non-asset links)
+    const anchorRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let foundNext: string | null = null;
+    let aMatch;
+
+    while ((aMatch = anchorRegex.exec(html)) !== null) {
+      const rawHref = aMatch[1].trim();
+      const aText = aMatch[2].replace(/<[^>]+>/g, "").trim();
+
+      if (rawHref.startsWith("#") || rawHref.startsWith("javascript:") || isStaticAsset(rawHref)) {
+        continue;
+      }
+
+      const fullHref = resolveUrl(current, rawHref);
+
+      // Prioritize download / verify buttons
+      if (/G-Direct|VGMLINKS|Verify|Human|Download|Get Link/i.test(aText)) {
+        foundNext = fullHref;
+        break;
+      }
+
+      // Secondary check on URL path keywords
+      if (!foundNext && /(?:fast-dl\.one\/dl\/|g-direct|download)/i.test(fullHref) && fullHref !== current) {
+        foundNext = fullHref;
+      }
+    }
+
+    if (foundNext && foundNext !== current) {
+      debugLog.push({ found: "anchor_link", link: foundNext });
+      current = foundNext;
+      hops++;
+      continue;
+    }
+
+    debugLog.push({ snippet: html.substring(0, 300).replace(/\s+/g, " ") });
     break;
   }
 
@@ -160,7 +217,6 @@ export default {
   async fetch(request: Request): Promise<Response> {
     const urlObj = new URL(request.url);
 
-    // Root status & documentation page
     if (urlObj.pathname === "/" || urlObj.pathname === "") {
       const docsHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -181,7 +237,7 @@ export default {
     <p>Supports byte-range scrubbing (HTTP 206) in video players and direct browser download.</p>
     <br>
     <p><span class="badge">GET</span> <code>/stream?url={TARGET_URL}</code></p>
-    <p><span class="badge">GET</span> <code>/stream?url={TARGET_URL}&debug=1</code> (JSON Trace)</p>
+    <p><span class="badge">GET</span> <code>/stream?url={TARGET_URL}&debug=1</code></p>
   </div>
 </body>
 </html>`;
@@ -190,7 +246,6 @@ export default {
       });
     }
 
-    // CORS preflight handling
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -203,7 +258,6 @@ export default {
       });
     }
 
-    // Unified Stream + Seek + Play + Download Route
     if (urlObj.pathname === "/stream" || urlObj.pathname === "/watch") {
       const inputUrl = urlObj.searchParams.get("url");
       const isDebug = urlObj.searchParams.get("debug") === "1";
@@ -218,7 +272,6 @@ export default {
       const debugLog: any[] = [];
       let finalUrl = inputUrl;
 
-      // Resolve destination URL if not directly a Google CDN link
       if (!inputUrl.includes("googleusercontent.com")) {
         const resolved = await resolveToGoogleUrl(inputUrl, debugLog);
         if (!resolved) {
@@ -226,7 +279,7 @@ export default {
             JSON.stringify({
               success: false,
               error: "Failed to resolve destination video URL",
-              debug: isDebug ? debugLog : "Append &debug=1 to see execution trace",
+              debug: debugLog,
             }),
             {
               status: 404,
@@ -240,7 +293,6 @@ export default {
         finalUrl = resolved;
       }
 
-      // If debug flag is passed, return JSON trace instead of video stream
       if (isDebug) {
         return new Response(
           JSON.stringify({ success: true, final_url: finalUrl, trace: debugLog }, null, 2),
@@ -253,7 +305,7 @@ export default {
         );
       }
 
-      // Proxy Range request to Google CDN for smooth timeline seeking
+      // Proxy Range request to Google CDN for timeline seeking
       const clientRange = request.headers.get("Range");
       const fetchHeaders = new Headers({
         "User-Agent":
@@ -292,16 +344,15 @@ export default {
         responseHeaders.set("content-type", "video/mp4");
       }
 
-      // 'inline' allows players to stream with scrubbing, while browser open allows direct download
       responseHeaders.set("Content-Disposition", 'inline; filename="video.mp4"');
 
       return new Response(videoRes.body, {
-        status: videoRes.status, // 206 Partial Content when seeking, 200 on initial full load
+        status: videoRes.status,
         headers: responseHeaders,
       });
     }
 
-    return new Response(JSON.stringify({ error: "Endpoint not found. Use /stream?url={URL}" }), {
+    return new Response(JSON.stringify({ error: "Endpoint not found" }), {
       status: 404,
       headers: { "Content-Type": "application/json" },
     });

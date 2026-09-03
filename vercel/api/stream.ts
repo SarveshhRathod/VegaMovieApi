@@ -24,7 +24,6 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
   const updateCookies = (res: Response) => {
     const rawCookies = res.headers.get('set-cookie');
     if (rawCookies) {
-      // Split and store cookies
       const parts = rawCookies.split(/,(?=\s*[^;]+=[^;]+)/);
       for (const part of parts) {
         const cookie = part.split(';')[0].trim();
@@ -64,7 +63,6 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
 
       updateCookies(res);
 
-      // Handle 3xx Redirects
       if ([301, 302, 303, 307, 308].includes(res.status)) {
         const location = res.headers.get('location');
         if (location) {
@@ -76,13 +74,11 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
 
       const html = await res.text();
 
-      // Check for Google video link directly
       const match = html.match(videoRegex);
       if (match) return match[0];
 
       const $ = cheerio.load(html);
 
-      // Check anchor tags
       let directLink: string | null = null;
       $('a[href]').each((_, el) => {
         const href = $(el).attr('href') || '';
@@ -92,7 +88,6 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
       });
       if (directLink) return directLink;
 
-      // Check verify buttons or forms
       const verifyBtn = $('button, a')
         .filter((_, el) =>
           /Click Here to Verify|Verify|I'm Human|Get Link|Download/i.test($(el).text())
@@ -154,7 +149,6 @@ async function extractGoogleVideoUrl(targetUrl: string): Promise<string | null> 
         }
       }
 
-      // Check G-Direct / Fast-DL redirects
       let nextHop: string | null = null;
       $('a[href]').each((_, el) => {
         const text = $(el).text();
@@ -201,7 +195,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).end();
     }
 
-    // Direct Google CDN link bypass
     if (url.includes('googleusercontent.com')) {
       return res.redirect(302, url);
     }
